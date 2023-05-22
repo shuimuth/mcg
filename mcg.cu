@@ -7,6 +7,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 #include <cuda_runtime.h>
 
@@ -16,6 +17,10 @@
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+/* Using updated (v2) interfaces to cublas and cusparse */
+#include <cublas_v2.h>
+#include <cusparse.h>
 
 namespace cg = cooperative_groups;
 
@@ -81,6 +86,11 @@ void genTridiag(int *I, int *J, float *val, int N, int nz)
     }
 
     I[N] = nz;
+}
+
+void genSparseMat()
+{
+    
 }
 
 // I - contains location of the given non-zero element in the row of the matrix
@@ -226,17 +236,17 @@ __device__ void gpuScaleVectorAndSaxpy(float *x, float *y, float a, float scale,
     }
 }
 
-__global__ void gpuDotProduct(double* result, float* vecA, float* vecB, int size, int startIdx) {
-    cg::grid_group grid = cg::this_grid();
+// __global__ void gpuDotProduct(double* result, float* vecA, float* vecB, int size, int startIdx) {
+//     cg::grid_group grid = cg::this_grid();
 
-    for (int i = grid.thread_rank(); i < size; i += grid.size()) {
-        int globalIdx = startIdx + i;
-        double tmp = static_cast<double>(vecA[globalIdx] * vecB[globalIdx]);
-        atomicAdd_(result, tmp);
-    }
-}
+//     for (int i = grid.thread_rank(); i < size; i += grid.size()) {
+//         int globalIdx = startIdx + i;
+//         double tmp = static_cast<double>(vecA[globalIdx] * vecB[globalIdx]);
+//         atomicAdd_(result, tmp);
+//     }
+// }
 
-__global__ void gpuDotProduct1(double *result, float *vecA, float *vecB, int size, int startIdx)
+__global__ void gpuDotProduct(double *result, float *vecA, float *vecB, int size, int startIdx)
 {
     __shared__ double tmp[THREADS_PER_BLOCK];
 
@@ -298,6 +308,15 @@ public:
         mallocGpuMem();
     }
 
+    void createSparseMat(cusparseSpMatDescr_t& mat)
+    {
+        cusparseStatus_t cusparseStatus;
+        cusparseStatus = cusparseCreateCsr(&mat, N, N, nz, I, J, val,
+                                    CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F);
+        // checkCudaErrors(cusparseStatus);
+    }
+
     void mallocGpuMem()
     {
         cudaMalloc(&I, (N + 1) * sizeof(int));
@@ -320,12 +339,30 @@ public:
     float *p;
     float *Ax;
     float *x;
-    double *dotProduct;
+    float *dotProduct;
+    float *alpha;
+    float *alpham1;
+    float *beta;
+    float *b;
+    float *a;
+    float *na;
+
     int size;
     int localNumRow;
     int deviceId;
     int global_begin_idx;
     cudaStream_t stream;
+
+    cublasHandle_t cublasHandle = 0;
+    cusparseHandle_t cusparseHandle = 0;
+
+    
+    cusparseSpMatDescr_t matA = NULL;
+    cusparseDnVecDescr_t vecx = NULL;
+    cusparseDnVecDescr_t vecp = NULL;
+    cusparseDnVecDescr_t vecAx = NULL;
+
+    void *cuSparseWorkBuffer = NULL;
 
     SPMat spMat;
 
@@ -338,6 +375,76 @@ public:
         localNumRow = numRow;
         spMat.init(size_, nnz);
         mallocGpuMem();
+
+        cusparseStatus_t cusparseStatus;
+        cublasStatus_t cublasStatus;
+        cublasStatus = cublasCreate(&cublasHandle);
+        // checkCudaErrors(cublasStatus);
+
+        /* Get handle to the CUSPARSE context */
+        cusparseStatus = cusparseCreate(&cusparseHandle);
+        // checkCudaErrors(cusparseStatus);
+
+        cusparseMatDescr_t descr = 0;
+        cusparseStatus = cusparseCreateMatDescr(&descr);
+        // checkCudaErrors(cusparseStatus);
+
+        cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);
+        cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO);
+    }
+
+    void createSparseMatVec()
+    {
+        spMat.createSparseMat(matA);
+        
+        cusparseCreateDnVec(&vecx, size, x, CUDA_R_32F);
+        cusparseCreateDnVec(&vecp, size, p, CUDA_R_32F);
+        cusparseCreateDnVec(&vecAx, size, Ax, CUDA_R_32F);
+    }
+
+    void createSpMVBuffer(const void* alpha, const void* beta)
+    {
+        checkCudaErrors(cudaSetDevice(deviceId));
+        /* Allocate workspace for cuSPARSE */
+        size_t bufferSize = 0;
+        cusparseSpMV_bufferSize(
+            cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, alpha, matA, vecx,
+            beta, vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+        
+        checkCudaErrors(cudaMalloc(&cuSparseWorkBuffer, bufferSize));
+    }
+
+    void createSpMVBuffer()
+    {
+        checkCudaErrors(cudaSetDevice(deviceId));
+        /* Allocate workspace for cuSPARSE */
+        size_t bufferSize = 0;
+        cusparseSpMV_bufferSize(
+            cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, alpha, matA, vecx,
+            beta, vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+        
+        checkCudaErrors(cudaMalloc(&cuSparseWorkBuffer, bufferSize));
+    }
+
+    void spMV(const void* alpha, const void* beta)
+    {
+        checkCudaErrors(cudaSetDevice(deviceId));
+        cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            alpha, matA, vecx, beta, vecAx, CUDA_R_32F,
+                            CUSPARSE_SPMV_ALG_DEFAULT, cuSparseWorkBuffer);
+    }
+
+    void spMV()
+    {
+        checkCudaErrors(cudaSetDevice(deviceId));
+        cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            alpha, matA, vecx, beta, vecAx, CUDA_R_32F,
+                            CUSPARSE_SPMV_ALG_DEFAULT, cuSparseWorkBuffer);
+    }
+
+    void destroySpMVBuffer()
+    {
+        checkCudaErrors(cudaFree(cuSparseWorkBuffer));
     }
 
     // void setDeviceId(int id) { deviceId = id; }
@@ -351,7 +458,13 @@ public:
         cudaMalloc(&p, size * sizeof(float));
         cudaMalloc(&Ax, size * sizeof(float));
         cudaMalloc(&x, size * sizeof(float));
-        cudaMalloc(&dotProduct, sizeof(double));
+        cudaMalloc(&dotProduct, sizeof(float));
+        cudaMalloc(&alpha, sizeof(float));
+        cudaMalloc(&alpham1, sizeof(float));
+        cudaMalloc(&beta, sizeof(float));
+        cudaMalloc(&b, sizeof(float));
+        cudaMalloc(&a, sizeof(float));
+        cudaMalloc(&na, sizeof(float));
         spMat.mallocGpuMem();
     }
 
@@ -362,6 +475,13 @@ public:
         cudaFree(Ax);
         cudaFree(x);
         cudaFree(dotProduct);
+        cudaFree(alpha);
+        cudaFree(alpham1);
+        cudaFree(beta);
+        cudaFree(b);
+        cudaFree(a);
+        cudaFree(na);
+        destroySpMVBuffer();
         spMat.destroy();
     }
 };
@@ -390,6 +510,46 @@ public:
         }
 
         stream = new cudaStream_t[numDevice];
+    }
+
+    void createSparseMatVec()
+    {
+        for(int i = 0; i < numDevice; i++)
+        {
+            cgData[i].createSparseMatVec();
+        }
+    }
+
+    void createSpMVBuffer(const void* alpha, const void* beta)
+    {
+        for(int i = 0; i < numDevice; i++)
+        {
+            cgData[i].createSpMVBuffer(alpha, beta);
+        }
+    }
+
+    void createSpMVBuffer()
+    {
+        for(int i = 0; i < numDevice; i++)
+        {
+            cgData[i].createSpMVBuffer();
+        }
+    }
+
+    void spMV(const void* alpha, const void* beta)
+    {
+        for(int i = 0; i < numDevice; i++)
+        {
+            cgData[i].spMV(alpha, beta);
+        }
+    }
+
+    void spMV()
+    {
+        for(int i = 0; i < numDevice; i++)
+        {
+            cgData[i].spMV();
+        }
     }
 
     void syncDevice(int deviceId)
@@ -429,6 +589,8 @@ public:
         for (int i = 0; i < numDevice; i++)
         {
             cgData[i].destroy();
+            // delete[] cgData;
+            // delete[] stream;
         }
     }
 };
@@ -489,6 +651,11 @@ void multiGpuSaxpy(MultiCGData &multiCGData)
     }
 }
 
+void multiGpuSaxpyCuSparse(MultiCGData &multiCGData)
+{
+
+}
+
 double multiGpuDotProductRR(MultiCGData &multiCGData)
 {
     dim3 dimGrid(32, 1, 1);
@@ -528,6 +695,29 @@ double multiGpuDotProductRR(MultiCGData &multiCGData)
     return sum;
 }
 
+float multiGpuDotProductRRCuSparse(MultiCGData &multiCGData)
+{
+    std::vector<float> dotResult(multiCGData.numDevice);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        CGData& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+        cublasSdot(data.cublasHandle, data.localNumRow, data.r + data.global_begin_idx, 1,
+                    data.r + data.global_begin_idx , 1, data.dotProduct);
+        checkCudaErrors(cudaMemcpyAsync(&dotResult[i], data.dotProduct, sizeof(float), cudaMemcpyDefault,multiCGData.stream[i]));
+    }
+
+    float sum = 0.0;
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        CGData& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+        checkCudaErrors(cudaDeviceSynchronize());
+        sum += dotResult[i];
+    }
+    return sum;
+}
+
 double multiGpuDotProductPAx(MultiCGData &multiCGData)
 {
     dim3 dimGrid(32, 1, 1);
@@ -562,6 +752,29 @@ double multiGpuDotProductPAx(MultiCGData &multiCGData)
     {
         checkCudaErrors(cudaSetDevice(i));
         cudaDeviceSynchronize();
+        sum += dotResult[i];
+    }
+    return sum;
+}
+
+float multiGpuDotProductPAxCuSparse(MultiCGData& multiCGData)
+{
+    std::vector<float> dotResult(multiCGData.numDevice);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        CGData& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+        cublasSdot(data.cublasHandle, data.localNumRow, data.p + data.global_begin_idx, 1,
+                    data.Ax + data.global_begin_idx , 1, data.dotProduct);
+        checkCudaErrors(cudaMemcpyAsync(&dotResult[i], data.dotProduct, sizeof(float), cudaMemcpyDefault,multiCGData.stream[i]));
+    }
+
+    float sum = 0.0;
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        CGData& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+        checkCudaErrors(cudaDeviceSynchronize());
         sum += dotResult[i];
     }
     return sum;
@@ -645,7 +858,7 @@ void initGpuData(MultiCGData &multiCGData)
 
 
 
-void ConjugateGrad(int *I, int *J, float *val, float *x, float *Ax, float *p,
+void ConjugateGrad1(int *I, int *J, float *val, float *x, float *Ax, float *p,
                    float *r, int nnz, int N, float tol, MultiCGData &multiCGData)
 {
     int max_iter = 10000;
@@ -1061,6 +1274,646 @@ double ConjugateGradGPU(MultiCGData &multiCGData, float tol)
 }
 
 
+void ConjugateGrad(int *I, int *J, float *val, float *x, float *Ax, float *p,
+                   float *r, int nnz, int N, float tol, MultiCGData &multiCGData)
+{
+
+    int max_iter = 10000;
+
+    float alpha = 1.0;
+    float beta = 0.0;
+    float alpham1 = -1.0;
+    float r0 = 0.0, b, a, na;
+    
+
+    cpuSpMV(I, J, val, nnz, N, alpha, x, Ax);
+    // multiGpuSpMV(multiCGData);
+
+    saxpy(Ax, r, alpham1, N);
+    // multiGpuSaxpy(multiCGData);
+
+    float r1 = dotProduct(r, r, N);
+
+
+    initGpuData(multiCGData);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+
+        cusparseSetPointerMode(data.cusparseHandle, CUSPARSE_POINTER_MODE_DEVICE);
+        cublasSetPointerMode(data.cublasHandle, CUBLAS_POINTER_MODE_DEVICE);
+        cusparseSetStream(data.cusparseHandle, multiCGData.stream[i]);
+        cublasSetStream(data.cublasHandle, multiCGData.stream[i]);
+
+        checkCudaErrors(cudaMemcpyAsync(data.alpha, &alpha, sizeof(float), cudaMemcpyHostToDevice, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.alpham1, &alpham1, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.beta, &beta, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+    }
+
+
+    multiCGData.createSparseMatVec();
+    multiCGData.createSpMVBuffer();
+    multiCGData.spMV();
+
+    // checkCudaErrors(cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+    //                             &alpha, matA, vecx, &beta, vecAx, CUDA_R_32F,
+    //                             CUSPARSE_SPMV_ALG_DEFAULT, buffer));
+
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& cgData = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(cgData.deviceId));
+        cublasSaxpy(cgData.cublasHandle, cgData.localNumRow, cgData.alpham1, cgData.Ax + cgData.global_begin_idx, 1, cgData.r + cgData.global_begin_idx, 1);
+    }
+
+    // cublasSaxpy(cublasHandle, N, &alpham1, Ax, 1, r, 1);
+
+    multiCGData.syncDevice();
+
+    std::vector<float> Ax_cpu(Ax, Ax + multiCGData.numRow);
+    std::vector<float> r_cpu(r, r + multiCGData.numRow);
+    std::vector<float> Ax_gpu(multiCGData.numRow);
+    std::vector<float> r_gpu(multiCGData.numRow);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaMemcpy(Ax_gpu.data(), data.Ax, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+        checkCudaErrors(cudaMemcpy(r_gpu.data(), data.r, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+
+    }
+
+
+    float r1_ = multiGpuDotProductRRCuSparse(multiCGData);
+
+    // for(int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     checkCudaErrors(cudaDeviceSynchronize());
+    // }
+    // auto r1_ = multiGpuDotProductRR(multiCGData);
+
+
+    int k = 1;
+
+    dim3 dimGrid(32, 1, 1);
+    dim3 dimBlock(THREADS_PER_BLOCK, 1, 1);
+
+    while (r1 > tol * tol && k <= max_iter)
+    {
+        if (k > 1)
+        {
+            b = r1 / r0;
+            scaleVector(p, b, N);
+            // gpu
+            // multiScaleP(multiCGData, b);
+
+            saxpy(r, p, alpha, N);
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+                cublasSscal(data.cublasHandle, data.localNumRow, data.b, data.p + data.global_begin_idx, 1);
+                cublasSaxpy(data.cublasHandle, data.localNumRow, data.alpha, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+            // end gpu saxpy            
+        }
+        else
+        {
+            for (int i = 0; i < N; i++)
+                p[i] = r[i];
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                cublasScopy(data.cublasHandle, data.localNumRow, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+        }
+
+        // sync p
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            CGData &data = multiCGData.cgData[i];
+            // transfer data to other device
+            for (int j = 1; j < multiCGData.numDevice; j++)
+            {
+                auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
+                checkCudaErrors(cudaMemcpyAsync(nextData.p + data.global_begin_idx, data.p + data.global_begin_idx,
+                                                data.localNumRow * sizeof(float), cudaMemcpyDefault, multiCGData.stream[data.deviceId]));
+            }
+        }
+        multiCGData.syncDevice();
+
+        std::vector<float> x_tmp(multiCGData.numRow, 2);
+        std::vector<float> p_tmp(multiCGData.numRow, 2);
+        std::vector<float> r_tmp(multiCGData.numRow, 2);
+        
+        for (int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto &data = multiCGData.cgData[i];
+            checkCudaErrors(cudaDeviceSynchronize());
+            checkCudaErrors(cudaMemcpy(x_tmp.data() + data.global_begin_idx, data.x + data.deviceId, data.localNumRow * sizeof(float), cudaMemcpyDefault));
+            checkCudaErrors(cudaMemcpy(p_tmp.data() + data.global_begin_idx, data.p + data.deviceId, data.localNumRow * sizeof(float), cudaMemcpyDefault));
+            checkCudaErrors(cudaMemcpy(r_tmp.data() + data.global_begin_idx, data.r + data.deviceId, data.localNumRow * sizeof(float), cudaMemcpyDefault));
+        }
+
+        cpuSpMV(I, J, val, nnz, N, alpha, p, Ax);
+
+        // gpu spmv
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto &data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            cusparseSpMV(
+                data.cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, data.alpha, data.matA, data.vecp,
+                data.beta, data.vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, data.cuSparseWorkBuffer);            
+        }
+
+        std::vector<float> tmp(multiCGData.numRow);
+        std::vector<float> tmp_cpu(multiCGData.numRow);
+
+        memcpy(tmp_cpu.data(), Ax, multiCGData.numRow * sizeof(float));
+        cudaMemcpy(tmp.data(), multiCGData.cgData[0].Ax, multiCGData.numRow * sizeof(float), cudaMemcpyDefault);
+        cudaMemcpy(tmp.data(), multiCGData.cgData[1].Ax, multiCGData.numRow * sizeof(float), cudaMemcpyDefault);
+
+        memcpy(tmp_cpu.data(), p, multiCGData.numRow * sizeof(float));
+
+        cudaMemcpy(tmp.data(), multiCGData.cgData[0].p, multiCGData.numRow * sizeof(float), cudaMemcpyDefault);
+        cudaMemcpy(tmp.data(), multiCGData.cgData[1].p, multiCGData.numRow * sizeof(float), cudaMemcpyDefault);        
+        
+
+        float dot = dotProduct(p, Ax, N);
+        a = r1 / dot;
+        
+        float dot_ = multiGpuDotProductPAxCuSparse(multiCGData);
+
+        saxpy(p, x, a, N);
+
+        na = -a;
+        saxpy(Ax, r, na, N);
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto& data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            checkCudaErrors(cudaMemcpyAsync(data.a, &a, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            checkCudaErrors(cudaMemcpyAsync(data.na, &na, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.a, data.p + data.global_begin_idx, 1, data.x + data.global_begin_idx, 1);
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.na, data.Ax + data.global_begin_idx, 1, data.r + data.global_begin_idx, 1);
+        }
+
+        r0 = r1;
+        r1 = dotProduct(r, r, N);
+
+        r1_ = multiGpuDotProductRRCuSparse(multiCGData);
+
+        printf("\nCPU code iteration = %3d, residual = %e\n", k, sqrt(r1));
+        k++;
+    }
+}
+
+
+float ConjugateGradCuSparse(MultiCGData &multiCGData, float tol)
+{
+
+    // cusparseLoggerSetLevel(4);
+    float alpha = 1.0;
+    float alpham1 = -1.0;
+    float beta = 0.0;
+    float r0 = 0.0;
+    float r1 = 0.0;
+    int max_iter = 1000;
+
+    initGpuData(multiCGData);
+
+    multiCGData.createSparseMatVec();
+    multiCGData.createSpMVBuffer(&alpha, &beta);
+    multiCGData.spMV(&alpha, &beta);
+
+    // checkCudaErrors(cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+    //                             &alpha, matA, vecx, &beta, vecAx, CUDA_R_32F,
+    //                             CUSPARSE_SPMV_ALG_DEFAULT, buffer));
+
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& cgData = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(cgData.deviceId));
+        cublasSaxpy(cgData.cublasHandle, cgData.localNumRow, &alpham1, cgData.Ax + cgData.global_begin_idx, 1, cgData.r + cgData.global_begin_idx, 1);
+    }
+
+    // cublasSaxpy(cublasHandle, N, &alpham1, Ax, 1, r, 1);
+
+
+    r1 = multiGpuDotProductRRCuSparse(multiCGData);
+    // cublasStatus = cublasSdot(cublasHandle, N, r, 1, r, 1, &r1);
+
+    int k = 1;
+
+    while (r1 > tol * tol && k <= max_iter) {
+        if (k > 1) {
+            float b = r1 / r0;
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                cublasSscal(data.cublasHandle, data.localNumRow, &b, data.p + data.global_begin_idx, 1);
+                cublasSaxpy(data.cublasHandle, data.localNumRow, &alpha, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+            // cublasStatus = cublasSscal(cublasHandle, N, &b, p, 1);
+            // cublasStatus = cublasSaxpy(cublasHandle, N, &alpha, r, 1, p, 1);
+        } else {
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                cublasScopy(data.cublasHandle, data.localNumRow, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+            // cublasStatus = cublasScopy(cublasHandle, N, r, 1, p, 1);
+        }
+
+
+        // sync p
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            CGData &data = multiCGData.cgData[i];
+            // transfer data to other device
+            for (int j = 1; j < multiCGData.numDevice; j++)
+            {
+                auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
+                checkCudaErrors(cudaMemcpyAsync(nextData.p + data.global_begin_idx, data.p + data.global_begin_idx,
+                                                data.localNumRow * sizeof(float), cudaMemcpyDefault, multiCGData.stream[data.deviceId]));
+            }
+        }
+        multiCGData.syncDevice();
+        
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto &data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            cusparseSpMV(
+                data.cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, data.matA, data.vecp,
+                &beta, data.vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, data.cuSparseWorkBuffer);            
+        }
+        // checkCudaErrors(cusparseSpMV(
+        //     cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, vecp,
+        //     &beta, vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, buffer));
+
+        float dot = multiGpuDotProductPAxCuSparse(multiCGData);
+
+        // cublasStatus = cublasSdot(cublasHandle, N, p, 1, Ax, 1, &dot);
+        float a = r1 / dot;
+        float na = -a;
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto& data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            cublasSaxpy(data.cublasHandle, data.localNumRow, &a, data.p + data.global_begin_idx, 1, data.x + data.global_begin_idx, 1);
+            cublasSaxpy(data.cublasHandle, data.localNumRow, &na, data.Ax + data.global_begin_idx, 1, data.r + data.global_begin_idx, 1);
+        }
+
+        // cublasStatus = cublasSaxpy(cublasHandle, N, &a, p, 1, x, 1);
+        
+        // cublasStatus = cublasSaxpy(cublasHandle, N, &na, Ax, 1, r, 1);
+
+        r0 = r1;
+        
+        r1 = multiGpuDotProductRRCuSparse(multiCGData);
+        // cublasStatus = cublasSdot(cublasHandle, N, r, 1, r, 1, &r1);
+        // multiCGData.syncDevice();
+        // cudaDeviceSynchronize();
+        printf("iteration = %3d, residual = %e\n", k, sqrt(r1));
+        k++;
+    }
+    return r1;
+}
+
+float ConjugateGradCuSparse2(MultiCGData &multiCGData, float tol)
+{
+    int max_iter = 100;
+
+    float alpha = 1.0;
+    float beta = 0.0;
+    float alpham1 = -1.0;
+    float r0 = 0.0, b, a, na;
+ 
+    initGpuData(multiCGData);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+
+        cusparseSetPointerMode(data.cusparseHandle, CUSPARSE_POINTER_MODE_DEVICE);
+        cublasSetPointerMode(data.cublasHandle, CUBLAS_POINTER_MODE_DEVICE);
+        cusparseSetStream(data.cusparseHandle, multiCGData.stream[i]);
+        cublasSetStream(data.cublasHandle, multiCGData.stream[i]);
+
+        checkCudaErrors(cudaMemcpyAsync(data.alpha, &alpha, sizeof(float), cudaMemcpyHostToDevice, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.alpham1, &alpham1, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.beta, &beta, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+    }
+
+
+    multiCGData.createSparseMatVec();
+    multiCGData.createSpMVBuffer();
+
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    multiCGData.spMV();
+
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& cgData = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(cgData.deviceId));
+        cublasSaxpy(cgData.cublasHandle, cgData.localNumRow, cgData.alpham1, cgData.Ax + cgData.global_begin_idx, 1, cgData.r + cgData.global_begin_idx, 1);
+    }
+
+    // cublasSaxpy(cublasHandle, N, &alpham1, Ax, 1, r, 1);
+
+    // multiCGData.syncDevice();
+
+    // std::vector<float> Ax_cpu(Ax, Ax + multiCGData.numRow);
+    // std::vector<float> r_cpu(r, r + multiCGData.numRow);
+    // std::vector<float> Ax_gpu(multiCGData.numRow);
+    // std::vector<float> r_gpu(multiCGData.numRow);
+    // for(int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     auto& data = multiCGData.cgData[i];
+    //     checkCudaErrors(cudaMemcpy(Ax_gpu.data(), data.Ax, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+    //     checkCudaErrors(cudaMemcpy(r_gpu.data(), data.r, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+
+    // }
+
+
+    float r1 = multiGpuDotProductRRCuSparse(multiCGData);
+
+    // for(int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     checkCudaErrors(cudaDeviceSynchronize());
+    // }
+    // auto r1_ = multiGpuDotProductRR(multiCGData);
+
+
+    int k = 1;
+
+    while (r1 > tol * tol && k <= max_iter)
+    {
+        if (k > 1)
+        {
+            b = r1 / r0;
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+                cublasSscal(data.cublasHandle, data.localNumRow, data.b, data.p + data.global_begin_idx, 1);
+                cublasSaxpy(data.cublasHandle, data.localNumRow, data.alpha, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+            // end gpu saxpy            
+        }
+        else
+        {
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                cublasScopy(data.cublasHandle, data.localNumRow, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+        }
+
+        // sync p
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            CGData &data = multiCGData.cgData[i];
+            // transfer data to other device
+            for (int j = 1; j < multiCGData.numDevice; j++)
+            {
+                auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
+                checkCudaErrors(cudaMemcpyAsync(nextData.p + data.global_begin_idx, data.p + data.global_begin_idx,
+                                                data.localNumRow * sizeof(float), cudaMemcpyDefault, multiCGData.stream[data.deviceId]));
+            }
+        }
+        multiCGData.syncDevice();
+
+        // gpu spmv
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto &data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            cusparseSpMV(
+                data.cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, data.alpha, data.matA, data.vecp,
+                data.beta, data.vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, data.cuSparseWorkBuffer);            
+        }
+        
+
+        float dot = multiGpuDotProductPAxCuSparse(multiCGData);
+        a = r1 / dot;
+        na = -a;
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto& data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            checkCudaErrors(cudaMemcpyAsync(data.a, &a, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            checkCudaErrors(cudaMemcpyAsync(data.na, &na, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.a, data.p + data.global_begin_idx, 1, data.x + data.global_begin_idx, 1);
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.na, data.Ax + data.global_begin_idx, 1, data.r + data.global_begin_idx, 1);
+        }
+
+        r0 = r1;
+
+        r1 = multiGpuDotProductRRCuSparse(multiCGData);
+
+        // printf("\nCPU code iteration = %3d, residual = %e\n", k, sqrt(r1));
+        k++;
+    }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    std::cout << "cg time: " << delta.count() / 1000.f << std::endl;
+    std::cout << "iteration: " << k << std::endl;
+    return r1;
+}
+
+
+float ConjugateGradCuSparse3(MultiCGData &multiCGData, float tol)
+{
+    int max_iter = 100;
+
+    float alpha = 1.0;
+    float beta = 0.0;
+    float alpham1 = -1.0;
+    float r0 = 0.0, b, a, na;
+ 
+    initGpuData(multiCGData);
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& data = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(data.deviceId));
+
+        cusparseSetPointerMode(data.cusparseHandle, CUSPARSE_POINTER_MODE_DEVICE);
+        cublasSetPointerMode(data.cublasHandle, CUBLAS_POINTER_MODE_DEVICE);
+        cusparseSetStream(data.cusparseHandle, multiCGData.stream[i]);
+        cublasSetStream(data.cublasHandle, multiCGData.stream[i]);
+
+        checkCudaErrors(cudaMemcpyAsync(data.alpha, &alpha, sizeof(float), cudaMemcpyHostToDevice, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.alpham1, &alpham1, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.beta, &beta, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+        checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+    }
+
+
+    multiCGData.createSparseMatVec();
+    multiCGData.createSpMVBuffer();
+
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    multiCGData.spMV();
+
+    for(int i = 0; i < multiCGData.numDevice; i++)
+    {
+        auto& cgData = multiCGData.cgData[i];
+        checkCudaErrors(cudaSetDevice(cgData.deviceId));
+        cublasSaxpy(cgData.cublasHandle, cgData.localNumRow, cgData.alpham1, cgData.Ax + cgData.global_begin_idx, 1, cgData.r + cgData.global_begin_idx, 1);
+    }
+
+    // cublasSaxpy(cublasHandle, N, &alpham1, Ax, 1, r, 1);
+
+    // multiCGData.syncDevice();
+
+    // std::vector<float> Ax_cpu(Ax, Ax + multiCGData.numRow);
+    // std::vector<float> r_cpu(r, r + multiCGData.numRow);
+    // std::vector<float> Ax_gpu(multiCGData.numRow);
+    // std::vector<float> r_gpu(multiCGData.numRow);
+    // for(int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     auto& data = multiCGData.cgData[i];
+    //     checkCudaErrors(cudaMemcpy(Ax_gpu.data(), data.Ax, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+    //     checkCudaErrors(cudaMemcpy(r_gpu.data(), data.r, sizeof(float) * multiCGData.numRow, cudaMemcpyDefault));
+
+    // }
+
+
+    float r1 = multiGpuDotProductRRCuSparse(multiCGData);
+
+    // for(int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     checkCudaErrors(cudaDeviceSynchronize());
+    // }
+    // auto r1_ = multiGpuDotProductRR(multiCGData);
+
+
+    int k = 1;
+
+    while (r1 > tol * tol && k <= max_iter)
+    {
+        if (k > 1)
+        {
+            b = r1 / r0;
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                checkCudaErrors(cudaMemcpyAsync(data.b, &b, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+                cublasSscal(data.cublasHandle, data.localNumRow, data.b, data.p + data.global_begin_idx, 1);
+                cublasSaxpy(data.cublasHandle, data.localNumRow, data.alpha, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+            // end gpu saxpy            
+        }
+        else
+        {
+            
+            for(int i = 0; i < multiCGData.numDevice; i++)
+            {
+                auto& data = multiCGData.cgData[i];
+                checkCudaErrors(cudaSetDevice(data.deviceId));
+                cublasScopy(data.cublasHandle, data.localNumRow, data.r + data.global_begin_idx, 1, data.p + data.global_begin_idx, 1);
+            }
+        }
+
+        // sync p
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            CGData &data = multiCGData.cgData[i];
+            // transfer data to other device
+            for (int j = 1; j < multiCGData.numDevice; j++)
+            {
+                auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
+                checkCudaErrors(cudaMemcpyAsync(nextData.p + data.global_begin_idx, data.p + data.global_begin_idx,
+                                                data.localNumRow * sizeof(float), cudaMemcpyDefault, multiCGData.stream[data.deviceId]));
+            }
+        }
+        multiCGData.syncDevice();
+
+        // gpu spmv
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto &data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            cusparseSpMV(
+                data.cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, data.alpha, data.matA, data.vecp,
+                data.beta, data.vecAx, CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, data.cuSparseWorkBuffer);            
+        }
+        
+
+        float dot = multiGpuDotProductPAxCuSparse(multiCGData);
+        a = r1 / dot;
+        na = -a;
+
+        for(int i = 0; i < multiCGData.numDevice; i++)
+        {
+            auto& data = multiCGData.cgData[i];
+            checkCudaErrors(cudaSetDevice(data.deviceId));
+            checkCudaErrors(cudaMemcpyAsync(data.a, &a, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            checkCudaErrors(cudaMemcpyAsync(data.na, &na, sizeof(float), cudaMemcpyDefault, multiCGData.stream[i]));
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.a, data.p + data.global_begin_idx, 1, data.x + data.global_begin_idx, 1);
+            cublasSaxpy(data.cublasHandle, data.localNumRow, data.na, data.Ax + data.global_begin_idx, 1, data.r + data.global_begin_idx, 1);
+        }
+
+        r0 = r1;
+
+        r1 = multiGpuDotProductRRCuSparse(multiCGData);
+
+        // printf("\nCPU code iteration = %3d, residual = %e\n", k, sqrt(r1));
+        k++;
+    }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    std::cout << "cg time: " << delta.count() / 1000.f << std::endl;
+    std::cout << "iteration: " << k << std::endl;
+    return r1;
+}
+
+void test(MultiCGData& multiCGData)
+{
+    // cusparseLoggerSetLevel(4);
+    float alpha = 1.0;
+    float alpham1 = -1.0;
+    float beta = 0.0;
+    float r0 = 0.0;
+    float r1 = 0.0;
+    int max_iter = 1000;
+
+    multiCGData.createSpMVBuffer(&alpha, &beta);
+    multiCGData.spMV(&alpha, &beta);
+
+}
 
 // Map of device version to device number
 std::multimap<std::pair<int, int>, int> getIdenticalGPUs()
@@ -1214,7 +2067,7 @@ void initDevice(const int kNumGpusRequired)
 
 int main(int, char **)
 {
-    constexpr size_t kNumGpusRequired = 2;
+    constexpr size_t kNumGpusRequired = 1;
     initDevice(kNumGpusRequired);
 
     int N = 0, nz = 0, *I = NULL, *J = NULL;
@@ -1226,7 +2079,7 @@ int main(int, char **)
     float *r, *p, *Ax;
 
     /* Generate a random tridiagonal symmetric matrix in CSR format */
-    N = 256;
+    N = 1000000;
     nz = (N - 2) * 3 + 4;
 
     I = new int[N + 1];
@@ -1265,181 +2118,191 @@ int main(int, char **)
     }
 #endif
 
-    ConjugateGrad(I, J, val, x_cpu, Ax_cpu, p_cpu, r_cpu, nz, N, tol, multiCGData);
-    auto residual = ConjugateGradGPU(multiCGData, tol);
+    // initGpuData(multiCGData);
 
-    std::vector<float> x_gpu(multiCGData.numRow);
-    for (int i = 0; i < multiCGData.numDevice; i++)
-    {
-        auto &data = multiCGData.cgData[i];
-        checkCudaErrors(cudaMemcpy(x_gpu.data() + data.global_begin_idx, data.x + data.global_begin_idx, data.localNumRow * sizeof(float), cudaMemcpyDefault));
-    }
+    // multiCGData.createSparseMatVec();
+
+    // test(multiCGData);
+
+    auto residual = ConjugateGradCuSparse2(multiCGData, tol);
+    std::cout << "residual: " << residual << std::endl;
+    // auto residual = ConjugateGradCuSparse(multiCGData, tol);
+
+    // std::vector<float> x_gpu(multiCGData.numRow);
+    // for (int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     auto &data = multiCGData.cgData[i];
+    //     checkCudaErrors(cudaMemcpy(x_gpu.data() + data.global_begin_idx, data.x + data.global_begin_idx, data.localNumRow * sizeof(float), cudaMemcpyDefault));
+    // }
     
-    float rsum, diff, err = 0.0;
+    // float rsum, diff, err = 0.0;
 
-    for (int i = 0; i < N; i++) {
-        rsum = 0.0;
+    // for (int i = 0; i < N; i++) {
+    //     rsum = 0.0;
 
-        for (int j = I[i]; j < I[i + 1]; j++) {
-            rsum += val[j] * x_gpu[J[j]];
-        }
+    //     for (int j = I[i]; j < I[i + 1]; j++) {
+    //         rsum += val[j] * x_gpu[J[j]];
+    //     }
 
-        diff = fabs(rsum - rhs);
+    //     diff = fabs(rsum - rhs);
 
-        if (diff > err) {
-            err = diff;
-        }
-    }
+    //     if (diff > err) {
+    //         err = diff;
+    //     }
+    // }
 
-    std::vector<float> x_tmp(multiCGData.numRow);
-    memcpy(x_tmp.data(), x_cpu, N * sizeof(float));
-    for (int i = 0; i < N; i++) {
-        rsum = 0.0;
+    // std::cout << "residual: " << residual << std::endl;
+    // std::cout << "err: " << err << std::endl;
 
-        for (int j = I[i]; j < I[i + 1]; j++) {
-            rsum += val[j] * x_gpu[J[j]];
-        }
+    // std::vector<float> x_tmp(multiCGData.numRow);
+    // memcpy(x_tmp.data(), x_cpu, N * sizeof(float));
+    // for (int i = 0; i < N; i++) {
+    //     rsum = 0.0;
 
-        diff = fabs(rsum - rhs);
+    //     for (int j = I[i]; j < I[i + 1]; j++) {
+    //         rsum += val[j] * x_gpu[J[j]];
+    //     }
 
-        if (diff > err) {
-            err = diff;
-        }
-    }
+    //     diff = fabs(rsum - rhs);
 
-    cpuSpMV(I, J, val, nz, N, 1, invec.data(), out.data());
-    saxpy(invec.data(), out.data(), 1, out.size());
-    float dotRes = dotProduct(invec.data(), out.data(), out.size());
+    //     if (diff > err) {
+    //         err = diff;
+    //     }
+    // }
 
-    cudaStream_t nStreams[kNumGpusRequired];
-    for (int i = 0; i < multiCGData.numDevice; i++)
-    {
-        cudaSetDevice(i);
-        checkCudaErrors(cudaStreamCreate(&nStreams[i]));
-    }
+    // cpuSpMV(I, J, val, nz, N, 1, invec.data(), out.data());
+    // saxpy(invec.data(), out.data(), 1, out.size());
+    // float dotRes = dotProduct(invec.data(), out.data(), out.size());
 
-    dim3 dimGrid(32, 1, 1);
-    dim3 dimBlock(THREADS_PER_BLOCK, 1, 1);
+    // cudaStream_t nStreams[kNumGpusRequired];
+    // for (int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     cudaSetDevice(i);
+    //     checkCudaErrors(cudaStreamCreate(&nStreams[i]));
+    // }
 
-    printf("Launching kernel\n");
+    // dim3 dimGrid(32, 1, 1);
+    // dim3 dimBlock(THREADS_PER_BLOCK, 1, 1);
 
-    for (int i = 0; i < multiCGData.numDevice; i++)
-    {
-        CGData &data = multiCGData.cgData[i];
+    // printf("Launching kernel\n");
 
-        checkCudaErrors(cudaSetDevice(data.deviceId));
+    // for (int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     CGData &data = multiCGData.cgData[i];
 
-        void *kernelArgs[] = {
-            (void *)&data.spMat.I,
-            (void *)&data.spMat.J,
-            (void *)&data.spMat.val,
-            (void *)&data.spMat.nz,
-            (void *)&data.localNumRow,
-            (void *)&data.global_begin_idx,
-            (void *)&data.x,
-            (void *)&data.Ax};
+    //     checkCudaErrors(cudaSetDevice(data.deviceId));
 
-        std::cout << "device " << data.deviceId << std::endl;
+    //     void *kernelArgs[] = {
+    //         (void *)&data.spMat.I,
+    //         (void *)&data.spMat.J,
+    //         (void *)&data.spMat.val,
+    //         (void *)&data.spMat.nz,
+    //         (void *)&data.localNumRow,
+    //         (void *)&data.global_begin_idx,
+    //         (void *)&data.x,
+    //         (void *)&data.Ax};
 
-        checkCudaErrors(cudaLaunchCooperativeKernel(
-            (void *)gpuSpMV, dimGrid, dimBlock, kernelArgs,
-            0, nStreams[data.deviceId]));
-        getLastCudaError("gpuSpMV execution failed");
+    //     std::cout << "device " << data.deviceId << std::endl;
 
-        float alpha = 1.0;
-        void *sapyArgs[] = {
-            &data.x,
-            &data.Ax,
-            &alpha,
-            &data.localNumRow,
-            &data.global_begin_idx};
+    //     checkCudaErrors(cudaLaunchCooperativeKernel(
+    //         (void *)gpuSpMV, dimGrid, dimBlock, kernelArgs,
+    //         0, nStreams[data.deviceId]));
+    //     getLastCudaError("gpuSpMV execution failed");
 
-        checkCudaErrors(cudaLaunchCooperativeKernel(
-            (void *)gpuSaxpy, dimGrid, dimBlock, sapyArgs,
-            0, nStreams[data.deviceId]));
-        getLastCudaError("gpuSaxpy execution failed");
+    //     float alpha = 1.0;
+    //     void *sapyArgs[] = {
+    //         &data.x,
+    //         &data.Ax,
+    //         &alpha,
+    //         &data.localNumRow,
+    //         &data.global_begin_idx};
 
-        void *dotProductArgs[] = {
-            &data.r,
-            &data.Ax,
-            &data.x,
-            &data.localNumRow,
-            &data.global_begin_idx};
+    //     checkCudaErrors(cudaLaunchCooperativeKernel(
+    //         (void *)gpuSaxpy, dimGrid, dimBlock, sapyArgs,
+    //         0, nStreams[data.deviceId]));
+    //     getLastCudaError("gpuSaxpy execution failed");
 
-        int sMemSize = sizeof(double) * THREADS_PER_BLOCK;
-        checkCudaErrors(cudaLaunchCooperativeKernel(
-            (void *)gpuDotProduct, dimGrid, dimBlock, dotProductArgs,
-            0, nStreams[data.deviceId]));
-        getLastCudaError("gpuDotProduct execution failed");
+    //     void *dotProductArgs[] = {
+    //         &data.r,
+    //         &data.Ax,
+    //         &data.x,
+    //         &data.localNumRow,
+    //         &data.global_begin_idx};
 
-        // transfer data to other device
-        for (int j = 1; j < multiCGData.numDevice; j++)
-        {
-            auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
-            checkCudaErrors(cudaMemcpyAsync(nextData.Ax + data.global_begin_idx, data.Ax + data.global_begin_idx,
-                                            data.localNumRow * sizeof(float), cudaMemcpyDefault, nStreams[data.deviceId]));
-        }
+    //     int sMemSize = sizeof(double) * THREADS_PER_BLOCK;
+    //     checkCudaErrors(cudaLaunchCooperativeKernel(
+    //         (void *)gpuDotProduct, dimGrid, dimBlock, dotProductArgs,
+    //         0, nStreams[data.deviceId]));
+    //     getLastCudaError("gpuDotProduct execution failed");
 
-        checkCudaErrors(cudaMemcpyAsync(dotResult.data() + data.deviceId, data.r, sizeof(double), cudaMemcpyDefault, nStreams[data.deviceId]));
-    }
+    //     // transfer data to other device
+    //     for (int j = 1; j < multiCGData.numDevice; j++)
+    //     {
+    //         auto &nextData = multiCGData.cgData[(i + j) % multiCGData.numDevice];
+    //         checkCudaErrors(cudaMemcpyAsync(nextData.Ax + data.global_begin_idx, data.Ax + data.global_begin_idx,
+    //                                         data.localNumRow * sizeof(float), cudaMemcpyDefault, nStreams[data.deviceId]));
+    //     }
 
-    std::cout << "I" << std::endl;
-    for (int i = 0; i < N + 1; i++)
-    {
-        std::cout << I[i] << " ";
-    }
-    std::cout << std::endl;
+    //     checkCudaErrors(cudaMemcpyAsync(dotResult.data() + data.deviceId, data.r, sizeof(double), cudaMemcpyDefault, nStreams[data.deviceId]));
+    // }
 
-    std::cout << "j" << std::endl;
-    for (int i = 0; i < nz; i++)
-    {
-        std::cout << J[i] << " ";
-    }
-    std::cout << std::endl;
+    // std::cout << "I" << std::endl;
+    // for (int i = 0; i < N + 1; i++)
+    // {
+    //     std::cout << I[i] << " ";
+    // }
+    // std::cout << std::endl;
 
-    std::cout << "val" << std::endl;
-    for (int i = 0; i < nz; i++)
-    {
-        std::cout << val[i] << " ";
-    }
-    std::cout << std::endl;
+    // std::cout << "j" << std::endl;
+    // for (int i = 0; i < nz; i++)
+    // {
+    //     std::cout << J[i] << " ";
+    // }
+    // std::cout << std::endl;
 
-    std::cout << "MV output" << std::endl;
-    for (int i = 0; i < N; i++)
-    {
-        std::cout << out[i] << " ";
-    }
-    std::cout << std::endl;
+    // std::cout << "val" << std::endl;
+    // for (int i = 0; i < nz; i++)
+    // {
+    //     std::cout << val[i] << " ";
+    // }
+    // std::cout << std::endl;
 
-    for (int i = 0; i < kNumGpusRequired; i++)
-    {
-        checkCudaErrors(cudaStreamSynchronize(nStreams[i]));
-    }
+    // std::cout << "MV output" << std::endl;
+    // for (int i = 0; i < N; i++)
+    // {
+    //     std::cout << out[i] << " ";
+    // }
+    // std::cout << std::endl;
 
-    std::vector<float> Ax_cpu_(N);
-    for (int i = 0; i < multiCGData.numDevice; i++)
-    {
-        auto &data = multiCGData.cgData[i];
-        checkCudaErrors(cudaMemcpy(Ax_cpu_.data(), data.Ax, Ax_cpu_.size() * sizeof(float), cudaMemcpyDefault));
+    // for (int i = 0; i < kNumGpusRequired; i++)
+    // {
+    //     checkCudaErrors(cudaStreamSynchronize(nStreams[i]));
+    // }
 
-        std::cout << "device " << i << std::endl;
-        for (int idx = 0; idx < Ax_cpu_.size(); idx++)
-        {
-            std::cout << Ax_cpu_[idx] << " ";
-        }
-        std::cout << std::endl;
-    }
+    // std::vector<float> Ax_cpu_(N);
+    // for (int i = 0; i < multiCGData.numDevice; i++)
+    // {
+    //     auto &data = multiCGData.cgData[i];
+    //     checkCudaErrors(cudaMemcpy(Ax_cpu_.data(), data.Ax, Ax_cpu_.size() * sizeof(float), cudaMemcpyDefault));
 
-    std::cout << "------------dot result--------------" << std::endl;
-    std::cout << "cpu dotproduct: " << dotRes << std::endl;
+    //     std::cout << "device " << i << std::endl;
+    //     for (int idx = 0; idx < Ax_cpu_.size(); idx++)
+    //     {
+    //         std::cout << Ax_cpu_[idx] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
 
-    double gpuDotSum = 0.0;
-    for (int i = 0; i < dotResult.size(); i++)
-    {
-        gpuDotSum += dotResult[i];
-        std::cout << dotResult[i] << " ";
-    }
-    std::cout << std::endl;
-    std::cout << "gpu dotproduct: " << gpuDotSum << std::endl;
+    // std::cout << "------------dot result--------------" << std::endl;
+    // std::cout << "cpu dotproduct: " << dotRes << std::endl;
+
+    // double gpuDotSum = 0.0;
+    // for (int i = 0; i < dotResult.size(); i++)
+    // {
+    //     gpuDotSum += dotResult[i];
+    //     std::cout << dotResult[i] << " ";
+    // }
+    // std::cout << std::endl;
+    // std::cout << "gpu dotproduct: " << gpuDotSum << std::endl;
     return 0;
 }
